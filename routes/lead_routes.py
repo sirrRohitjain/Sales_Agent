@@ -41,9 +41,12 @@ async def list_leads(
     return {"leads": leads, "count": len(leads), "limit": limit, "offset": offset}
 
 
+from uuid import UUID
+
 @router.get("/{lead_id}")
-async def get_lead(lead_id: str):
-    lead = get_lead_by_id(lead_id)
+async def get_lead(lead_id: UUID): # FastAPI validates this is a proper UUID
+    clean_id = str(lead_id) # Convert back to string for your DB query
+    lead = get_lead_by_id(clean_id)
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     return lead
@@ -57,7 +60,7 @@ async def create_lead(req: CreateLeadRequest):
 
 
 @router.patch("/{lead_id}/status")
-async def update_status(lead_id: str, req: UpdateLeadStatusRequest):
+async def update_status(lead_id: UUID, req: UpdateLeadStatusRequest):
     valid_statuses = ["pending", "called", "not_interested", "applied", "retry", "unreachable"]
     if req.status not in valid_statuses:
         raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {valid_statuses}")

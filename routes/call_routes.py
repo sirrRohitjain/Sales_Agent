@@ -15,6 +15,7 @@ import logging
 from datetime import datetime
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
+from uuid import UUID
 
 from graph.state import initial_state
 from graph.graph_builder import run_next_node, NODE_FUNCTIONS
@@ -39,7 +40,7 @@ logger  = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════
 
 class StartCallRequest(BaseModel):
-    lead_id: str | None = None   # if None, auto-picks next priority lead
+    lead_id: UUID | None = None  # if None, auto-picks next priority lead
 
 class StartCallResponse(BaseModel):
     call_id: str
@@ -49,7 +50,7 @@ class StartCallResponse(BaseModel):
     current_node: str
 
 class RespondRequest(BaseModel):
-    call_id: str
+    call_id: UUID                # Validated automatically
     user_text: str               # transcribed user speech (from STT)
 
 class RespondResponse(BaseModel):
@@ -60,7 +61,7 @@ class RespondResponse(BaseModel):
     extracted_so_far: dict       # what we've collected
 
 class EndCallRequest(BaseModel):
-    call_id: str
+    call_id: UUID                # Validated automatically
     reason: str = "user_hangup"  # user_hangup | timeout | error
 
 
@@ -80,9 +81,10 @@ async def start_call(req: StartCallRequest):
     """
     # ── Pick lead ──────────────────────────────────────────────────
     if req.lead_id:
-        lead = get_lead_by_id(req.lead_id)
+        clean_lead_id = str(req.lead_id)
+        lead = get_lead_by_id(clean_lead_id)
         if not lead:
-            raise HTTPException(status_code=404, detail=f"Lead {req.lead_id} not found")
+            raise HTTPException(status_code=404, detail=f"Lead {clean_lead_id} not found")
     else:
         lead = get_next_lead()
         if not lead:
@@ -149,10 +151,12 @@ async def respond(req: RespondRequest):
     4. Save updated state to Redis
     5. Return agent reply
     """
+    clean_call_id = str(req.call_id)
+    
     # ── Load session ───────────────────────────────────────────────
-    state = get_state(req.call_id)
+    state = get_state(clean_call_id)
     if state is None:
-        raise HTTPException(status_code=404, detail=f"Call session {req.call_id} not found or expired")
+        raise HTTPException(status_code=404, detail=f"Call session {clean_call_id} not found or expired")
 
     # ── Append user message ────────────────────────────────────────
     user_text = req.user_text.strip()
@@ -162,13 +166,13 @@ async def respond(req: RespondRequest):
     state["messages"].append({"role": "user", "content": user_text})
 
     # ── Save user transcript ───────────────────────────────────────
-    save_transcript_chunk(req.call_id, "customer", user_text)
+    save_transcript_chunk(clean_call_id, "customer", user_text)
 
     # ── Run next graph node ────────────────────────────────────────
     try:
         state, next_node = run_next_node(state)
     except Exception as e:
-        logger.error(f"[{req.call_id}] Node execution error: {e}")
+        logger.error(f"[{clean_call_id}] Node execution error: {e}")
         raise HTTPException(status_code=500, detail=f"Agent processing error: {e}")
 
     # ── Check if conversation ended ────────────────────────────────
@@ -183,22 +187,22 @@ async def respond(req: RespondRequest):
 
     # ── Save agent transcript ──────────────────────────────────────
     if agent_reply:
-        save_transcript_chunk(req.call_id, "agent", agent_reply)
+        save_transcript_chunk(clean_call_id, "agent", agent_reply)
 
     # ── Update Redis or clean up if done ──────────────────────────
     if is_done:
-        _cleanup_call(req.call_id, state)
+        _cleanup_call(clean_call_id, state)
     else:
-        save_state(req.call_id, state)
-        refresh_ttl(req.call_id)
+        save_state(clean_call_id, state)
+        refresh_ttl(clean_call_id)
 
     logger.info(
-        f"[{req.call_id}] Turn {state.get('turn_count')} | "
+        f"[{clean_call_id}] Turn {state.get('turn_count')} | "
         f"node: {state.get('current_node')} | done: {is_done}"
     )
 
     return RespondResponse(
-        call_id=req.call_id,
+        call_id=clean_call_id,
         agent_reply=agent_reply,
         current_node=state.get("current_node", ""),
         is_done=is_done,
@@ -216,17 +220,18 @@ async def end_call(req: EndCallRequest, background_tasks: BackgroundTasks):
     Force-end a call (user hung up, timeout, etc.)
     Saves whatever we have collected so far.
     """
-    state = get_state(req.call_id)
+    clean_call_id = str(req.call_id)
+    state = get_state(clean_call_id)
 
     if state:
         # Save partial data
         background_tasks.add_task(_save_partial_call, state, req.reason)
 
-    _cleanup_call(req.call_id, state)
+    _cleanup_call(clean_call_id, state)
 
     return {
         "message": "Call ended",
-        "call_id": req.call_id,
+        "call_id": clean_call_id,
         "reason": req.reason,
         "data_collected": state.get("extracted_data", {}) if state else {}
     }
@@ -237,9 +242,10 @@ async def end_call(req: EndCallRequest, background_tasks: BackgroundTasks):
 # ══════════════════════════════════════════════════════════════════
 
 @router.get("/{call_id}/state")
-async def get_call_state(call_id: str):
+async def get_call_state(call_id: UUID):
     """Debug endpoint — returns full AgentState for a call."""
-    state = get_state(call_id)
+    clean_call_id = str(call_id)
+    state = get_state(clean_call_id)
     if not state:
         raise HTTPException(status_code=404, detail="Session not found")
     # Remove messages from response (too verbose) — use /transcript for that
@@ -253,17 +259,18 @@ async def get_call_state(call_id: str):
 # ══════════════════════════════════════════════════════════════════
 
 @router.get("/{call_id}/transcript")
-async def get_transcript(call_id: str):
+async def get_transcript(call_id: UUID):
     """Returns the full conversation transcript from PostgreSQL."""
-    rows = get_full_transcript(call_id)
+    clean_call_id = str(call_id)
+    rows = get_full_transcript(clean_call_id)
     if not rows:
         # Fallback to Redis (call might still be active)
-        state = get_state(call_id)
+        state = get_state(clean_call_id)
         if state:
-            return {"call_id": call_id, "source": "redis", "transcript": state["messages"]}
+            return {"call_id": clean_call_id, "source": "redis", "transcript": state["messages"]}
         raise HTTPException(status_code=404, detail="Transcript not found")
 
-    return {"call_id": call_id, "source": "db", "transcript": rows}
+    return {"call_id": clean_call_id, "source": "db", "transcript": rows}
 
 
 # ══════════════════════════════════════════════════════════════════
