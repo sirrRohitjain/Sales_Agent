@@ -71,11 +71,14 @@ app.add_middleware(
 )
 
 # ── Routes ─────────────────────────────────────────────────────────
+from routes import voice_routes
+from routes import voice_routes
 from routes.call_routes import router as call_router
 from routes.lead_routes import router as lead_router
 
 app.include_router(call_router)
 app.include_router(lead_router)
+app.include_router(voice_routes.router)  # <-- ADD THIS LINE!
 
 
 # ── Health Check ───────────────────────────────────────────────────

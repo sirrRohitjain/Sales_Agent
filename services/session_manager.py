@@ -138,3 +138,42 @@ def get_active_call_count() -> int:
     """Count how many calls are currently active (for monitoring)."""
     keys = _run_redis_cmd("KEYS", "call:*:state")
     return len(keys) if keys else 0
+
+
+# ══════════════════════════════════════════════════════════════════
+#  PHASE 3: ASYNC SESSION MANAGER WRAPPER
+# ══════════════════════════════════════════════════════════════════
+
+class SessionManager:
+    """
+    Wrapper class to provide async methods for Phase 3 webhooks and Celery tasks,
+    while using the existing synchronous Upstash Redis logic underneath.
+    """
+    async def get_session(self, call_id: str) -> dict | None:
+        state = get_state(call_id)
+        if state is None:
+            return None
+            
+        # If the state already has a "graph_state" key (saved by Phase 3), return it directly.
+        if "graph_state" in state:
+            return state
+            
+        # If it's a raw LangGraph state from Phase 2, wrap it so Phase 3 routes don't crash.
+        return {"graph_state": state}
+
+    async def save_session(self, call_id: str, session: dict):
+        save_state(call_id, session)
+
+    async def delete_session(self, call_id: str):
+        delete_state(call_id)
+
+    async def acquire_lead_lock(self, lead_id: str) -> bool:
+        return lock_lead(lead_id)
+
+    async def release_lead_lock(self, lead_id: str):
+        unlock_lead(lead_id)
+
+    async def create_session(self, call_id: str, initial_state: dict):
+        # Wraps the initial LangGraph state into the Phase 3 session format
+        session = {"graph_state": initial_state}
+        save_state(call_id, session)

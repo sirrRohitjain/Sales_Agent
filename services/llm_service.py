@@ -23,8 +23,8 @@ groq_llm = ChatGroq(
     max_tokens=350,     # keep replies short like a real salesperson
     timeout=10,
 )
-# response = groq_llm.invoke([SystemMessage(content="Hello i am priya a credit card sales agent working for axis bank")])
-# print("Groq test response:", response.content[:100])  # Print first 100 chars to verify connection
+response = groq_llm.invoke([SystemMessage(content="Hello i am priya a credit card sales agent working for axis bank")])
+print("Groq test response:", response.content[:100])  # Print first 100 chars to verify connection
 
 # ── Fallback: Google Gemini Flash (free tier) ──────────────────────
 try:

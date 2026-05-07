@@ -105,19 +105,87 @@ def insert_lead(data: dict) -> str:
     return lead_id
 
 
+def get_pending_leads(limit: int = 10) -> list[dict]:
+    """
+    Fetch leads with status='pending' — used by Celery beat auto-dialer.
+    """
+    return get_all_leads(limit=limit, status="pending")
+
+
 # ══════════════════════════════════════════════════════════════════
 #  CALLS
 # ══════════════════════════════════════════════════════════════════
 
-def create_call_record(call_id: str, lead_id: str) -> str:
+def create_call_record(
+    call_id: str,
+    lead_id: str,
+    status: str = "initiated",
+    initiated_at: datetime = None,
+    twilio_sid: str = None,
+) -> str:
+    """
+    Insert a new call record.
+    """
     query = text("""
         INSERT INTO calls (id, lead_id, start_time, outcome, created_at)
-        VALUES (:id, :lead_id, NOW(), NULL, NOW())
+        VALUES (:id, :lead_id, :start_time, NULL, NOW())
+        ON CONFLICT (id) DO NOTHING
     """)
     with get_db() as db:
-        db.execute(query, {"id": call_id, "lead_id": lead_id})
+        db.execute(query, {
+            "id": call_id,
+            "lead_id": lead_id,
+            "start_time": initiated_at or datetime.utcnow(),
+        })
     logger.info(f"Call record created: {call_id}")
     return call_id
+
+
+def update_call_status(
+    call_id: str,
+    status: str,
+    twilio_sid: str = None,
+    duration_seconds: int = None,
+    consent_given: bool = None,
+    card_recommended: str = None,
+) -> None:
+    """
+    Called by voice_routes.py status webhook.
+    Maps Twilio status strings → our outcome column values.
+    """
+    outcome_map = {
+        "completed":   "completed",
+        "failed":      "failed",
+        "busy":        "busy",
+        "no-answer":   "not_answered",
+        "canceled":    "failed",
+        "ringing":     None,       # still live — don't write outcome yet
+        "in-progress": None,
+    }
+    outcome = outcome_map.get(status, status)
+
+    fields = ["updated_at = NOW()"]
+    params: dict = {"id": call_id}
+
+    if outcome is not None:
+        fields.append("outcome = :outcome")
+        params["outcome"] = outcome
+
+    if status in ("completed", "failed", "busy", "no-answer", "canceled"):
+        fields.append("end_time = NOW()")
+
+    if duration_seconds is not None:
+        fields.append("duration_seconds = :duration")
+        params["duration"] = duration_seconds
+
+    if twilio_sid is not None:
+        logger.info(f"Twilio SID for call {call_id}: {twilio_sid}")
+
+    query = text(f"UPDATE calls SET {', '.join(fields)} WHERE id = :id")
+    with get_db() as db:
+        db.execute(query, params)
+
+    logger.info(f"Call {call_id} → {status}")
 
 
 def update_call_outcome(call_id: str, outcome: str, duration_seconds: int = 0):
@@ -198,6 +266,39 @@ def save_application(state: dict) -> str:
     return app_id
 
 
+def create_application_record(
+    application_id: str,
+    call_id: str,
+    lead_id: str,
+    card_name: str,
+    status: str = "pending_kyc",
+    created_at: datetime = None,
+) -> None:
+    """
+    Lightweight insert — called by Celery process_application task after consent.
+    """
+    query = text("""
+        INSERT INTO applications (
+            id, lead_id, call_id, card_recommended,
+            consent_given, status, created_at
+        ) VALUES (
+            :id, :lead_id, :call_id, :card_name,
+            true, :status, :created_at
+        )
+        ON CONFLICT (id) DO NOTHING
+    """)
+    with get_db() as db:
+        db.execute(query, {
+            "id": application_id,
+            "lead_id": lead_id,
+            "call_id": call_id,
+            "card_name": card_name,
+            "status": status,
+            "created_at": created_at or datetime.utcnow(),
+        })
+    logger.info(f"Application record created: {application_id} | card={card_name}")
+
+
 def get_application_by_call(call_id: str) -> dict | None:
     query = text("SELECT * FROM applications WHERE call_id = :call_id")
     with get_db() as db:
@@ -219,24 +320,24 @@ def update_application_status(app_id: str, status: str):
 #  TRANSCRIPTS
 # ══════════════════════════════════════════════════════════════════
 
-def save_transcript_chunk(call_id: str, speaker: str, text_content: str):
+def save_transcript_chunk(call_id: str, role: str, message: str):
     """Save individual transcript lines during the call (real-time)."""
     query = text("""
-        INSERT INTO transcripts (id, call_id, speaker, content, created_at)
-        VALUES (:id, :call_id, :speaker, :content, NOW())
+        INSERT INTO transcripts (id, call_id, role, message, created_at)
+        VALUES (:id, :call_id, :role, :message, NOW())
     """)
     with get_db() as db:
         db.execute(query, {
             "id": str(uuid.uuid4()),
             "call_id": call_id,
-            "speaker": speaker,
-            "content": text_content,
+            "role": role,
+            "message": message,
         })
 
 
 def get_full_transcript(call_id: str) -> list[dict]:
     query = text("""
-        SELECT speaker, content, created_at
+        SELECT role, message as content, created_at
         FROM transcripts WHERE call_id = :call_id
         ORDER BY created_at ASC
     """)
@@ -279,17 +380,17 @@ def update_card_issuance_status(issuance_id: str, status: str, reference: str = 
 #  AUDIT LOG
 # ══════════════════════════════════════════════════════════════════
 
-def log_audit_event(entity_type: str, entity_id: str, action: str, details: dict = None):
+def log_audit_event(entity_type: str, entity_id: str, event_type: str, details: dict = None):
     query = text("""
-        INSERT INTO audit_log (id, entity_type, entity_id, action, details, created_at)
-        VALUES (:id, :entity_type, :entity_id, :action, :details, NOW())
+        INSERT INTO audit_log (id, entity_type, entity_id, event_type, details, created_at)
+        VALUES (:id, :entity_type, :entity_id, :event_type, :details, NOW())
     """)
     with get_db() as db:
         db.execute(query, {
             "id": str(uuid.uuid4()),
             "entity_type": entity_type,
             "entity_id": entity_id,
-            "action": action,
+            "event_type": event_type,
             "details": json.dumps(details or {}),
         })
 
@@ -301,7 +402,7 @@ def log_audit_event(entity_type: str, entity_id: str, action: str, details: dict
 def get_daily_stats() -> dict:
     query = text("""
         SELECT
-            COUNT(DISTINCT c.id)                                    AS total_calls,
+            COUNT(DISTINCT c.id)                                          AS total_calls,
             COUNT(DISTINCT CASE WHEN c.outcome='completed' THEN c.id END) AS connected,
             COUNT(DISTINCT CASE WHEN a.consent_given=true THEN a.id END)  AS converted,
             COUNT(DISTINCT CASE WHEN ci.status='issued' THEN ci.id END)   AS cards_issued
